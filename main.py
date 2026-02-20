@@ -1,69 +1,120 @@
 import discord
 from discord.ext import commands
 from discord import app_commands
+from cryptography.fernet import Fernet
+import sqlite3
+import os
+
+# ================= ENCRYPTION =================
+
+ENCRYPTION_KEY = b'dLmYrr0fTZ5ESH7RGoAYmfv14rn2JaflOdWgmdKbdzA='
+cipher = Fernet(ENCRYPTION_KEY)
+
+# ================= DATABASE =================
+
+conn = sqlite3.connect("callsigns.db")
+cursor = conn.cursor()
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS callsigns (
+    user_id INTEGER PRIMARY KEY,
+    callsign BLOB
+)
+""")
+
+conn.commit()
+
+# ================= ENV VARS =================
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+GUILD_ID = int(os.getenv("GUILD_ID"))
+LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID"))
+
+# ================= BOT CLASS =================
 
 class Client(commands.Bot):
-	async def on_ready(self):
-		print(f'Logged on as {self.user}!')
+    async def on_ready(self):
+        print(f'Logged on as {self.user}!')
 
-		try:
-			guild = discord.Object(id=1463577470191140896)
-			synced = await self.tree.sync(guild=guild)
-			print(f'Synced {len(synced)} command(s) to guild {guild.id}')
+        try:
+            guild = discord.Object(id=GUILD_ID)
+            synced = await self.tree.sync(guild=guild)
+            print(f'Synced {len(synced)} command(s) to guild {guild.id}')
+        except Exception as e:
+            print(f'Error syncing commands: {e}')
 
-		except Exception as e:
-			print(f'Error syncing commands: {e}')
+    async def on_message(self, message):
+        if message.author == self.user:
+            return
 
-	async def on_message(self, message):
-		if message.author == self.user:
-			return
+        if message.content.lower().startswith('afk'):
+            await message.channel.send(f'Cya later, {message.author}')
 
-		if message.content.startswith('AFK') or message.content.startswith('afk'):
-					await message.channel.send(f'Cya later, {message.author}')
+    async def on_reaction_add(self, reaction, user):
+        if user.bot:
+            return
+        await reaction.message.channel.send('You reacted!')
 
-	async def on_reaction_add(self, reaction, user):
-		await reaction.message.channel.send('You reacted!')
-
+# ================= BOT SETUP =================
 
 intents = discord.Intents.default()
 intents.message_content = True
 client = Client(command_prefix="?", intents=intents)
 
-GUILD_ID = discord.Object(id=1463577470191140896)
+# ================= SLASH COMMAND =================
 
-@client.tree.command(name="hello", description="Say hello!", guild=GUILD_ID)
-async  def sayHello(interaction: discord.Interaction):
-	await interaction.response.send_message("Hi there!")
+@client.tree.command(
+    name="setcs",
+    description="Set your callsign.",
+    guild=discord.Object(id=GUILD_ID)
+)
+async def setcs(interaction: discord.Interaction, callsign: str):
 
+    member = interaction.user
 
-@client.tree.command(name="print", description="Print string.", guild=GUILD_ID)
-async  def printer(interaction: discord.Interaction, printer: str):
-	await interaction.response.send_message(printer)
+    # Check whitelist role
+    has_role = any(role.id == WL_ID for role in member.roles)
 
-@client.tree.command(name="embed", description="Create an embed.", guild=GUILD_ID)
-async  def embed(interaction: discord.Interaction, titl: str, desc: str):
-	embed = discord.Embed(title=titl, description=desc, color=discord.Colour.brand_green())
-	# embed.add_field(name="Field 1 Title", value="Field 1 Value", inline=False)
-	# embed.add_field(name="Field 2 Title", value="Field 2 Value", inline=False)
-	await interaction.response.send_message(embed=embed)
-
-@client.tree.command(name="server", description="Toggle server status.", guild=GUILD_ID)
-async def server_status(interaction: discord.Interaction):
-    channel = interaction.guild.get_channel(1463611154889707543)
-
-    if channel is None:
-        await interaction.response.send_message("Channel not found.", ephemeral=True)
+    if not has_role:
+        await interaction.response.send_message(
+            "❌ You are not whitelisted to set a callsign.",
+            ephemeral=True
+        )
         return
 
-    if channel.name == "Status-❎":
-        await channel.edit(name="Status-✅")
-        await interaction.response.send_message("Server is now ONLINE.")
-    else:
-        await channel.edit(name="Status-❎")
-        await interaction.response.send_message("Server is now OFFLINE.")
+    # Enforce minimum length (no admin bypass anymore)
+    if len(callsign) < 4:
+        await interaction.response.send_message(
+            "❌ Callsign must be at least 4 characters long.",
+            ephemeral=True
+        )
+        return
 
-client.run()
+    # Encrypt callsign
+    encrypted_callsign = cipher.encrypt(callsign.encode())
 
+    # Insert or update database
+    cursor.execute("""
+    INSERT INTO callsigns (user_id, callsign)
+    VALUES (?, ?)
+    ON CONFLICT(user_id) DO UPDATE SET callsign=excluded.callsign
+    """, (member.id, encrypted_callsign))
 
-# To start py, do "py main.py"
-# To end py, do CTRL+C in terminal
+    conn.commit()
+
+    await interaction.response.send_message(
+        f"✅ Your callsign has been set to **{callsign}**",
+        ephemeral=True
+    )
+
+    # Send log message
+    log_channel = interaction.guild.get_channel(LOG_CHANNEL_ID)
+
+    if log_channel:
+        await log_channel.send(
+            f"{member.name}/<@{member.id}> just changed their callsign to **{callsign}**"
+        )
+
+# ================= RUN =================
+
+client.run(BOT_TOKEN)
